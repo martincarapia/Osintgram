@@ -54,7 +54,8 @@ You can find detailed commands usage [here](doc/COMMANDS.md).
 
 ## FAQ
 1. **Can I access the contents of a private profile?** No, you cannot get information on private profiles. You can only get information from a public profile or a profile you follow. The tools that claim to be successful are scams!
-2. **What is and how I can bypass the `challenge_required` error?** The `challenge_required` error means that Instagram notice a suspicious behavior on your profile, so needs to check if you are a real person or a bot. To avoid this you should follow the suggested link and complete the required operation (insert a code, confirm email, etc)
+2. **What is and how I can bypass the `challenge_required` error?** The `challenge_required` error means that Instagram noticed suspicious behavior on your profile, so it needs to check if you are a real person or a bot. To avoid this you should follow the suggested link and complete the required operation (insert a code, confirm email, etc). Using a `sessionid` from an already-authenticated browser session can help avoid this.
+3. **Can I use a session ID instead of username/password?** Yes. Add your `sessionid` to `config/credentials.ini` or set the `INSTAGRAM_SESSIONID` environment variable. This is the recommended approach if you experience login issues or IP blacklisting.
 
 
 ## Installation ⚙️
@@ -77,7 +78,7 @@ You can find detailed commands usage [here](doc/COMMANDS.md).
   
 5. Run `pip install -r requirements.txt`
 
-6. Open the `credentials.ini` file in the `config` folder and write your Instagram account username and password in the corresponding fields. Or use `hikerapi_token` from https://hikerapi.com/tokens (first 100 requests are free after registration and confirmation of your tg)
+6. Open the `credentials.ini` file in the `config` folder and write your Instagram account username and password in the corresponding fields. Optionally, you can provide a `sessionid` for cookie-based authentication (recommended to avoid IP blacklisting). Or use `hikerapi_token` from https://hikerapi.com/tokens (first 100 requests are free after registration and confirmation of your tg)
 
     Alternatively, you can run the `make setup` command to populate this file for you.
 
@@ -187,4 +188,4 @@ Here is a list of Osintgram's contributors:
 
 ## External library 🔗
 
-[Instagram API](https://github.com/ping/instagram_private_api)
+[instagrapi](https://github.com/subzeroid/instagrapi)

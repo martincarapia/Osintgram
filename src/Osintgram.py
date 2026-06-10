@@ -3,21 +3,32 @@ import json
 import sys
 import urllib
 import os
-import codecs
+import logging
 from pathlib import Path
 
 import httpx
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
 
 from geopy.geocoders import Nominatim
-from instagram_private_api import Client as AppClient
-from instagram_private_api import ClientCookieExpiredError, ClientLoginRequiredError, ClientError, ClientThrottledError
+from instagrapi import Client
+from instagrapi.exceptions import (
+    BadPassword,
+    ChallengeRequired,
+    FeedbackRequired,
+    LoginRequired,
+    PleaseWaitFewMinutes,
+    ReloginAttemptExceeded,
+    ClientThrottledError,
+    RecaptchaChallengeForm,
+    SelectContactPointRecoveryForm,
+)
+from instagrapi.utils import json_value
 
 from prettytable import PrettyTable
 
 from src import printcolors as pc
 from src import config
+
+logger = logging.getLogger(__name__)
 
 
 class Osintgram:
@@ -39,11 +50,12 @@ class Osintgram:
         self.output_dir = output_dir or self.output_dir        
         u = config.getUsername()
         p = config.getPassword()
+        s = config.getSessionId()
         self.clear_cookies(clear_cookies)
         self.cli_mode = is_cli
         if not is_cli:
           print("\nAttempt to login...")
-        self.login(u, p)
+        self.login(u, p, session_id=s)
         self.setTarget(target)
         self.writeFile = is_file
         self.jsonDump = is_json
@@ -63,31 +75,91 @@ class Osintgram:
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
     def __get_feed__(self):
+        medias = self.api.user_medias(self.target_id, amount=0)
         data = []
-
-        result = self.api.user_feed(str(self.target_id))
-        data.extend(result.get('items', []))
-
-        next_max_id = result.get('next_max_id')
-        while next_max_id:
-            results = self.api.user_feed(str(self.target_id), max_id=next_max_id)
-            data.extend(results.get('items', []))
-            next_max_id = results.get('next_max_id')
-
+        for m in medias:
+            data.append(self._media_to_dict(m))
         return data
 
+    def _media_to_dict(self, media):
+        d = {
+            'id': media.id,
+            'pk': media.pk,
+            'taken_at': int(media.taken_at.timestamp()) if media.taken_at else None,
+            'media_type': media.media_type,
+            'like_count': media.like_count or 0,
+            'comment_count': media.comment_count or 0,
+            'caption': None,
+            'location': None,
+            'user': {
+                'pk': media.user.pk if media.user else None,
+                'username': media.user.username if media.user else None,
+                'full_name': media.user.full_name if media.user else None,
+            },
+        }
+
+        if media.caption_text:
+            d['caption'] = {'text': media.caption_text}
+
+        if media.location:
+            d['location'] = {
+                'lat': media.location.lat,
+                'lng': media.location.lng,
+                'name': media.location.name if hasattr(media.location, 'name') else None,
+            }
+
+        if media.media_type == 1 and media.thumbnail_url:
+            d['image_versions2'] = {
+                'candidates': [{'url': str(media.thumbnail_url)}]
+            }
+        elif media.media_type == 2 and media.video_url:
+            d['video_url'] = str(media.video_url)
+            if media.thumbnail_url:
+                d['image_versions2'] = {
+                    'candidates': [{'url': str(media.thumbnail_url)}]
+                }
+        elif media.media_type == 8 and media.resources:
+            carousel = []
+            for r in media.resources:
+                item = {'id': str(r.pk), 'media_type': r.media_type}
+                if r.thumbnail_url:
+                    item['image_versions2'] = {
+                        'candidates': [{'url': str(r.thumbnail_url)}]
+                    }
+                if r.video_url:
+                    item['video_url'] = str(r.video_url)
+                carousel.append(item)
+            d['carousel_media'] = carousel
+
+        if media.usertags:
+            d['usertags'] = {
+                'in': [
+                    {
+                        'user': {
+                            'pk': ut.user.pk,
+                            'username': ut.user.username,
+                            'full_name': ut.user.full_name,
+                        }
+                    }
+                    for ut in media.usertags
+                ]
+            }
+
+        return d
+
     def __get_comments__(self, media_id):
+        comments_raw = self.api.media_comments(media_id, amount=0)
         comments = []
-
-        result = self.api.media_comments(str(media_id))
-        comments.extend(result.get('comments', []))
-
-        next_max_id = result.get('next_max_id')
-        while next_max_id:
-            results = self.api.media_comments(str(media_id), max_id=next_max_id)
-            comments.extend(results.get('comments', []))
-            next_max_id = results.get('next_max_id')
-
+        for c in comments_raw:
+            comments.append({
+                'text': c.text,
+                'user': {
+                    'pk': c.user.pk,
+                    'username': c.user.username,
+                    'full_name': c.user.full_name,
+                },
+                'user_id': c.user.pk,
+            })
         return comments
 
     def __printTargetBanner__(self):
@@ -285,16 +357,16 @@ class Osintgram:
 
         for post in data:
             post_id = post.get('id')
-            comments = self.api.media_n_comments(post_id)
+            comments = self.__get_comments__(post_id)
             for comment in comments:
                 t.add_row([post_id, comment.get('user_id'), comment.get('user').get('username'), comment.get('text')])
-                comment = {
-                        "post_id": post_id,
-                        "user_id":comment.get('user_id'), 
-                        "username": comment.get('user').get('username'),
-                        "comment": comment.get('text')
-                    }
-                _comments.append(comment)
+                comment_data = {
+                    "post_id": post_id,
+                    "user_id": comment.get('user_id'),
+                    "username": comment.get('user').get('username'),
+                    "comment": comment.get('text')
+                }
+                _comments.append(comment_data)
         
         print(t)
         if self.writeFile:
@@ -307,7 +379,7 @@ class Osintgram:
             file_name_json = self.output_dir + "/" + self.target + "_comment_data.json"
             with open(file_name_json, 'w') as f:
                 f.write("{ \"Comments\":[ \n")
-                f.write('\n'.join(json.dumps(comment) for comment in _comments) + ',\n')
+                f.write('\n'.join(json.dumps(c) for c in _comments) + ',\n')
                 f.write("]} ")
 
 
@@ -317,32 +389,18 @@ class Osintgram:
 
         pc.printout("Searching for target followers...\n")
 
-        _followers = []
+        followers_dict = self.api.user_followers(self.target_id)
         followers = []
 
-
-        rank_token = AppClient.generate_uuid()
-        data = self.api.user_followers(str(self.target_id), rank_token=rank_token)
-
-        _followers.extend(data.get('users', []))
-
-        next_max_id = data.get('next_max_id')
-        while next_max_id:
-            sys.stdout.write("\rCatched %i followers" % len(_followers))
-            sys.stdout.flush()
-            results = self.api.user_followers(str(self.target_id), rank_token=rank_token, max_id=next_max_id)
-            _followers.extend(results.get('users', []))
-            next_max_id = results.get('next_max_id')
-
-        print("\n")
-            
-        for user in _followers:
+        for user_id, user_short in followers_dict.items():
             u = {
-                'id': user['pk'],
-                'username': user['username'],
-                'full_name': user['full_name']
+                'id': user_short.pk,
+                'username': user_short.username,
+                'full_name': user_short.full_name or ''
             }
             followers.append(u)
+
+        pc.printout("\nFound " + str(len(followers)) + " followers\n", pc.GREEN)
 
         t = PrettyTable(['ID', 'Username', 'Full Name'])
         t.align["ID"] = "l"
@@ -383,31 +441,18 @@ class Osintgram:
 
         pc.printout("Searching for target followings...\n")
 
-        _followings = []
+        following_dict = self.api.user_following(self.target_id)
         followings = []
 
-        rank_token = AppClient.generate_uuid()
-        data = self.api.user_following(str(self.target_id), rank_token=rank_token)
-
-        _followings.extend(data.get('users', []))
-
-        next_max_id = data.get('next_max_id')
-        while next_max_id:
-            sys.stdout.write("\rCatched %i followings" % len(_followings))
-            sys.stdout.flush()
-            results = self.api.user_following(str(self.target_id), rank_token=rank_token, max_id=next_max_id)
-            _followings.extend(results.get('users', []))
-            next_max_id = results.get('next_max_id')
-
-        print("\n")
-
-        for user in _followings:
+        for user_id, user_short in following_dict.items():
             u = {
-                'id': user['pk'],
-                'username': user['username'],
-                'full_name': user['full_name']
+                'id': user_short.pk,
+                'username': user_short.username,
+                'full_name': user_short.full_name or ''
             }
             followings.append(u)
+
+        pc.printout("\nFound " + str(len(followings)) + " followings\n", pc.GREEN)
 
         t = PrettyTable(['ID', 'Username', 'Full Name'])
         t.align["ID"] = "l"
@@ -450,18 +495,10 @@ class Osintgram:
 
         hashtags = []
         counter = 1
-        texts = []
 
-        data = self.api.user_feed(str(self.target_id))
-        texts.extend(data.get('items', []))
+        data = self.__get_feed__()
 
-        next_max_id = data.get('next_max_id')
-        while next_max_id:
-            results = self.api.user_feed(str(self.target_id), max_id=next_max_id)
-            texts.extend(results.get('items', []))
-            next_max_id = results.get('next_max_id')
-
-        for post in texts:
+        for post in data:
             if post['caption'] is not None:
                 caption = post['caption']['text']
                 for s in caption.split():
@@ -509,79 +546,70 @@ class Osintgram:
 
     def get_user_info(self):
         try:
-            endpoint = 'users/{user_id!s}/full_detail_info/'.format(**{'user_id': self.target_id})
-            content = self.api._call_api(endpoint)
-           
-            data = content['user_detail']['user']
+            data = self.api.user_info(self.target_id)
 
             pc.printout("[ID] ", pc.GREEN)
-            pc.printout(str(data['pk']) + '\n')
+            pc.printout(str(data.pk) + '\n')
             pc.printout("[FULL NAME] ", pc.RED)
-            pc.printout(str(data['full_name']) + '\n')
+            pc.printout(str(data.full_name) + '\n')
             pc.printout("[BIOGRAPHY] ", pc.CYAN)
-            pc.printout(str(data['biography']) + '\n')
+            pc.printout(str(data.biography) + '\n')
             pc.printout("[FOLLOWED] ", pc.BLUE)
-            pc.printout(str(data['follower_count']) + '\n')
+            pc.printout(str(data.follower_count) + '\n')
             pc.printout("[FOLLOW] ", pc.GREEN)
-            pc.printout(str(data['following_count']) + '\n')
+            pc.printout(str(data.following_count) + '\n')
             pc.printout("[BUSINESS ACCOUNT] ", pc.RED)
-            pc.printout(str(data['is_business']) + '\n')
-            if data['is_business']:
-                if not data['can_hide_category']:
-                    pc.printout("[BUSINESS CATEGORY] ")
-                    pc.printout(str(data['category']) + '\n')
+            pc.printout(str(data.is_business) + '\n')
+            if data.is_business and data.category:
+                pc.printout("[BUSINESS CATEGORY] ")
+                pc.printout(str(data.category) + '\n')
             pc.printout("[VERIFIED ACCOUNT] ", pc.CYAN)
-            pc.printout(str(data['is_verified']) + '\n')
-            if 'public_email' in data and data['public_email']:
+            pc.printout(str(data.is_verified) + '\n')
+            if data.public_email:
                 pc.printout("[EMAIL] ", pc.BLUE)
-                pc.printout(str(data['public_email']) + '\n')
+                pc.printout(str(data.public_email) + '\n')
             pc.printout("[HD PROFILE PIC] ", pc.GREEN)
-            pc.printout(str(data['hd_profile_pic_url_info']['url']) + '\n')
-            if 'fb_page_call_to_action_id' in data and data['fb_page_call_to_action_id']: 
-                pc.printout("[FB PAGE] ", pc.RED)
-                pc.printout(str(data['connected_fb_page']) + '\n')
-            if 'whatsapp_number' in data and data['whatsapp_number']:
-                pc.printout("[WHATSAPP NUMBER] ", pc.GREEN)
-                pc.printout(str(data['whatsapp_number']) + '\n')
-            if 'city_name' in data and data['city_name']:
-                pc.printout("[CITY] ", pc.YELLOW)
-                pc.printout(str(data['city_name']) + '\n')
-            if 'address_street' in data and data['address_street']:
-                pc.printout("[ADDRESS STREET] ", pc.RED)
-                pc.printout(str(data['address_street']) + '\n')
-            if 'contact_phone_number' in data and data['contact_phone_number']:
+            pc.printout(str(data.profile_pic_url_hd or data.profile_pic_url) + '\n')
+            if data.external_url:
+                pc.printout("[EXTERNAL URL] ", pc.CYAN)
+                pc.printout(str(data.external_url) + '\n')
+            if data.public_phone_number:
                 pc.printout("[CONTACT PHONE NUMBER] ", pc.CYAN)
-                pc.printout(str(data['contact_phone_number']) + '\n')
+                pc.printout(str(data.public_phone_number) + '\n')
+            if data.city_name:
+                pc.printout("[CITY] ", pc.YELLOW)
+                pc.printout(str(data.city_name) + '\n')
+            if data.address_street:
+                pc.printout("[ADDRESS STREET] ", pc.RED)
+                pc.printout(str(data.address_street) + '\n')
 
             if self.jsonDump:
                 user = {
-                    'id': data['pk'],
-                    'full_name': data['full_name'],
-                    'biography': data['biography'],
-                    'edge_followed_by': data['follower_count'],
-                    'edge_follow': data['following_count'],
-                    'is_business_account': data['is_business'],
-                    'is_verified': data['is_verified'],
-                    'profile_pic_url_hd': data['hd_profile_pic_url_info']['url']
+                    'id': data.pk,
+                    'full_name': data.full_name,
+                    'biography': data.biography,
+                    'edge_followed_by': data.follower_count,
+                    'edge_follow': data.following_count,
+                    'is_business_account': data.is_business,
+                    'is_verified': data.is_verified,
+                    'profile_pic_url_hd': str(data.profile_pic_url_hd or data.profile_pic_url)
                 }
-                if 'public_email' in data and data['public_email']:
-                    user['email'] = data['public_email']
-                if 'fb_page_call_to_action_id' in data and data['fb_page_call_to_action_id']: 
-                    user['connected_fb_page'] = data['fb_page_call_to_action_id']
-                if 'whatsapp_number' in data and data['whatsapp_number']:
-                    user['whatsapp_number'] = data['whatsapp_number']
-                if 'city_name' in data and data['city_name']:
-                    user['city_name'] = data['city_name']
-                if 'address_street' in data and data['address_street']:
-                    user['address_street'] = data['address_street']
-                if 'contact_phone_number' in data and data['contact_phone_number']:
-                    user['contact_phone_number'] = data['contact_phone_number']
+                if data.public_email:
+                    user['email'] = data.public_email
+                if data.external_url:
+                    user['external_url'] = str(data.external_url)
+                if data.public_phone_number:
+                    user['contact_phone_number'] = str(data.public_phone_number)
+                if data.city_name:
+                    user['city_name'] = data.city_name
+                if data.address_street:
+                    user['address_street'] = data.address_street
 
                 json_file_name = self.output_dir + "/" + self.target + "_info.json"
                 with open(json_file_name, 'w') as f:
                     json.dump(user, f)
 
-        except ClientError as e:
+        except Exception as e:
             print(e)
             pc.printout("Oops... " + str(self.target) + " non exist, please enter a valid username.", pc.RED)
             pc.printout("\n")
@@ -739,16 +767,10 @@ class Osintgram:
 
         pc.printout("Searching for users who tagged target...\n")
 
+        tagged_medias = self.api.usertag_medias(self.target_id, amount=0)
         posts = []
-
-        result = self.api.usertag_feed(self.target_id)
-        posts.extend(result.get('items', []))
-
-        next_max_id = result.get('next_max_id')
-        while next_max_id:
-            results = self.api.user_feed(str(self.target_id), max_id=next_max_id)
-            posts.extend(results.get('items', []))
-            next_max_id = results.get('next_max_id')
+        for m in tagged_medias:
+            posts.append(self._media_to_dict(m))
 
         if len(posts) > 0:
             pc.printout("\nWoohoo! We found " + str(len(posts)) + " photos\n", pc.GREEN)
@@ -805,13 +827,10 @@ class Osintgram:
         if self.check_private_profile():
             return
 
-        content = httpx.get("https://www.instagram.com/" + str(self.target) + "/?__a=1")
-        data = content.json()
+        medias = self.api.user_medias(self.target_id, amount=0)
 
-        dd = data['graphql']['user']['edge_owner_to_timeline_media']['edges']
-
-        if len(dd) > 0:
-            pc.printout("\nWoohoo! We found " + str(len(dd)) + " descriptions\n", pc.GREEN)
+        if len(medias) > 0:
+            pc.printout("\nWoohoo! We found " + str(len(medias)) + " descriptions\n", pc.GREEN)
 
             count = 1
 
@@ -822,9 +841,8 @@ class Osintgram:
             json_data = {}
             descriptions_list = []
 
-            for i in dd:
-                node = i.get('node')
-                descr = node.get('accessibility_caption')
+            for m in medias:
+                descr = m.accessibility_caption or m.caption_text or ''
                 t.add_row([str(count), descr])
 
                 if self.jsonDump:
@@ -873,17 +891,8 @@ class Osintgram:
             pc.printout("Wrong value entered\n", pc.RED)
             return
 
-        data = []
+        data = self.__get_feed__()
         counter = 0
-
-        result = self.api.user_feed(str(self.target_id))
-        data.extend(result.get('items', []))
-
-        next_max_id = result.get('next_max_id')
-        while next_max_id:
-            results = self.api.user_feed(str(self.target_id), max_id=next_max_id)
-            data.extend(results.get('items', []))
-            next_max_id = results.get('next_max_id')
 
         try:
             for item in data:
@@ -893,22 +902,23 @@ class Osintgram:
                     counter = counter + 1
                     url = item["image_versions2"]["candidates"][0]["url"]
                     photo_id = item["id"]
-                    end = self.output_dir + "/" + self.target + "_" + photo_id + ".jpg"
+                    end = self.output_dir + "/" + self.target + "_" + str(photo_id) + ".jpg"
                     urllib.request.urlretrieve(url, end)
                     sys.stdout.write("\rDownloaded %i" % counter)
                     sys.stdout.flush()
-                else:
+                elif "carousel_media" in item:
                     carousel = item["carousel_media"]
                     for i in carousel:
                         if counter == limit:
                             break
-                        counter = counter + 1
-                        url = i["image_versions2"]["candidates"][0]["url"]
-                        photo_id = i["id"]
-                        end = self.output_dir + "/" + self.target + "_" + photo_id + ".jpg"
-                        urllib.request.urlretrieve(url, end)
-                        sys.stdout.write("\rDownloaded %i" % counter)
-                        sys.stdout.flush()
+                        if "image_versions2" in i:
+                            counter = counter + 1
+                            url = i["image_versions2"]["candidates"][0]["url"]
+                            photo_id = i["id"]
+                            end = self.output_dir + "/" + self.target + "_" + str(photo_id) + ".jpg"
+                            urllib.request.urlretrieve(url, end)
+                            sys.stdout.write("\rDownloaded %i" % counter)
+                            sys.stdout.flush()
 
         except AttributeError:
             pass
@@ -924,30 +934,18 @@ class Osintgram:
     def get_user_propic(self):
 
         try:
-            endpoint = 'users/{user_id!s}/full_detail_info/'.format(**{'user_id': self.target_id})
-            content = self.api._call_api(endpoint)
+            data = self.api.user_info(self.target_id)
+            URL = str(data.profile_pic_url_hd or data.profile_pic_url)
 
-            data = content['user_detail']['user']
-
-            if "hd_profile_pic_url_info" in data:
-                URL = data["hd_profile_pic_url_info"]['url']
-            else:
-                #get better quality photo
-                items = len(data['hd_profile_pic_versions'])
-                URL = data["hd_profile_pic_versions"][items-1]['url']
-
-            if URL != "":
+            if URL:
                 end = self.output_dir + "/" + self.target + "_propic.jpg"
                 urllib.request.urlretrieve(URL, end)
                 pc.printout("Target propic saved in output folder\n", pc.GREEN)
-
             else:
                 pc.printout("Sorry! No results found :-(\n", pc.RED)
-        
-        except ClientError as e:
-            error = json.loads(e.error_response)
-            print(error['message'])
-            print(error['error_title'])
+
+        except Exception as e:
+            print(e)
             exit(2)
 
     def get_user_stories(self):
@@ -956,22 +954,21 @@ class Osintgram:
 
         pc.printout("Searching for target stories...\n")
 
-        data = self.api.user_reel_media(str(self.target_id))
+        stories = self.api.user_stories(self.target_id)
 
         counter = 0
 
-        if data['items'] is not None:  # no stories avaibile
-            counter = data['media_count']
-            for i in data['items']:
-                story_id = i["id"]
-                if i["media_type"] == 1:  # it's a photo
-                    url = i['image_versions2']['candidates'][0]['url']
-                    end = self.output_dir + "/" + self.target + "_" + story_id + ".jpg"
+        if stories:
+            counter = len(stories)
+            for story in stories:
+                story_id = story.id
+                if story.media_type == 1:
+                    url = str(story.thumbnail_url)
+                    end = self.output_dir + "/" + self.target + "_" + str(story_id) + ".jpg"
                     urllib.request.urlretrieve(url, end)
-
-                elif i["media_type"] == 2:  # it's a gif or video
-                    url = i['video_versions'][0]['url']
-                    end = self.output_dir + "/" + self.target + "_" + story_id + ".mp4"
+                elif story.media_type == 2:
+                    url = str(story.video_url)
+                    end = self.output_dir + "/" + self.target + "_" + str(story_id) + ".mp4"
                     urllib.request.urlretrieve(url, end)
 
         if counter > 0:
@@ -1054,29 +1051,23 @@ class Osintgram:
 
     def get_user(self, username):
         try:
-            content = self.api.username_info(username)
+            content = self.api.user_info_by_username(username)
             if self.writeFile:
                 file_name = self.output_dir + "/" + self.target + "_user_id.txt"
                 file = open(file_name, "w")
-                file.write(str(content['user']['pk']))
+                file.write(str(content.pk))
                 file.close()
 
             user = dict()
-            user['id'] = content['user']['pk']
-            user['is_private'] = content['user']['is_private']
+            user['id'] = content.pk
+            user['is_private'] = content.is_private
 
             return user
-        except ClientError as e:
-            pc.printout('ClientError {0!s} (Code: {1:d}, Response: {2!s})'.format(e.msg, e.code, e.error_response), pc.RED)
-            error = json.loads(e.error_response)
-            if 'message' in error:
-                print(error['message'])
-            if 'error_title' in error:
-                print(error['error_title'])
-            if 'challenge' in error:
-                print("Please follow this link to complete the challenge: " + error['challenge']['url'])    
+        except Exception as e:
+            pc.printout(str(e), pc.RED)
+            pc.printout("\n")
             sys.exit(2)
-        
+
 
     def set_write_file(self, flag):
         if flag:
@@ -1102,76 +1093,100 @@ class Osintgram:
 
         self.jsonDump = flag
 
-    def login(self, u, p):
-        try:
-            settings_file = "config/settings.json"
-            if not os.path.isfile(settings_file):
-                # settings file does not exist
-                print(f'Unable to find file: {settings_file!s}')
+    def login(self, u, p, session_id=None):
+        settings_file = "config/settings.json"
+        self.api = Client()
+        self.api.handle_exception = self._handle_exception
 
-                # login new
-                self.api = AppClient(auto_patch=True, authenticate=True, username=u, password=p,
-                                     on_login=lambda x: self.onlogin_callback(x, settings_file))
+        logged_in = False
 
-            else:
-                with open(settings_file) as file_data:
-                    cached_settings = json.load(file_data, object_hook=self.from_json)
-                # print('Reusing settings: {0!s}'.format(settings_file))
+        if session_id:
+            try:
+                if self.api.login_by_sessionid(session_id):
+                    logged_in = True
+                    pc.printout("Logged in via session ID\n", pc.GREEN)
+            except Exception as e:
+                logger.info("Session ID login failed: %s" % e)
 
-                # reuse auth settings
-                self.api = AppClient(
-                    username=u, password=p,
-                    settings=cached_settings,
-                    on_login=lambda x: self.onlogin_callback(x, settings_file))
+        if not logged_in:
+            session = None
+            if os.path.isfile(settings_file):
+                session = self.api.load_settings(settings_file)
 
-        except (ClientCookieExpiredError, ClientLoginRequiredError) as e:
-            print(f'ClientCookieExpiredError/ClientLoginRequiredError: {e!s}')
+            if session:
+                try:
+                    self.api.set_settings(session)
+                    self.api.login(u, p)
+                    try:
+                        self.api.get_timeline_feed()
+                    except LoginRequired:
+                        logger.info("Session is invalid, need to login via username and password")
+                        old_session = self.api.get_settings()
+                        self.api.set_settings({})
+                        self.api.set_uuids(old_session["uuids"])
+                        self.api.login(u, p)
+                    logged_in = True
+                except Exception as e:
+                    logger.info("Couldn't login user using session information: %s" % e)
 
-            # Login expired
-            # Do relogin but use default ua, keys and such
-            self.api = AppClient(auto_patch=True, authenticate=True, username=u, password=p,
-                                 on_login=lambda x: self.onlogin_callback(x, settings_file))
+            if not logged_in:
+                try:
+                    logger.info("Attempting to login via username and password. username: %s" % u)
+                    if self.api.login(u, p):
+                        logged_in = True
+                except Exception as e:
+                    logger.info("Couldn't login user using username and password: %s" % e)
 
-        except ClientError as e:
-            pc.printout('ClientError {0!s} (Code: {1:d}, Response: {2!s})'.format(e.msg, e.code, e.error_response), pc.RED)
-            error = json.loads(e.error_response)
-            pc.printout(error['message'], pc.RED)
-            pc.printout(": ", pc.RED)
-            pc.printout(e.msg, pc.RED)
-            pc.printout("\n")
-            if 'challenge' in error:
-                print("Please follow this link to complete the challenge: " + error['challenge']['url'])
+        if not logged_in:
+            pc.printout("Couldn't login with either password, session, or session ID\n", pc.RED)
             exit(9)
 
-    def to_json(self, python_object):
-        if isinstance(python_object, bytes):
-            return {'__class__': 'bytes',
-                    '__value__': codecs.encode(python_object, 'base64').decode()}
-        raise TypeError(repr(python_object) + ' is not JSON serializable')
+        self.api.dump_settings(settings_file)
 
-    def from_json(self, json_object):
-        if '__class__' in json_object and json_object['__class__'] == 'bytes':
-            return codecs.decode(json_object['__value__'].encode(), 'base64')
-        return json_object
-
-    def onlogin_callback(self, api, new_settings_file):
-        cache_settings = api.settings
-        with open(new_settings_file, 'w') as outfile:
-            json.dump(cache_settings, outfile, default=self.to_json)
-            # print('SAVED: {0!s}'.format(new_settings_file))
+    def _handle_exception(self, client, e):
+        if isinstance(e, BadPassword):
+            client.logger.exception(e)
+            if client.relogin_attempt > 0:
+                raise ReloginAttemptExceeded(e)
+            raise
+        elif isinstance(e, LoginRequired):
+            client.logger.exception(e)
+            client.relogin()
+            return True
+        elif isinstance(e, ChallengeRequired):
+            api_path = json_value(client.last_json, "challenge", "api_path")
+            if api_path == "/challenge/":
+                logger.warning("Generic challenge flow requires manual handling")
+            else:
+                try:
+                    client.challenge_resolve(client.last_json)
+                except (ChallengeRequired, SelectContactPointRecoveryForm, RecaptchaChallengeForm) as exc:
+                    raise exc
+            return True
+        elif isinstance(e, FeedbackRequired):
+            message = client.last_json.get("feedback_message", "")
+            logger.warning("Action blocked by Instagram: %s", message)
+        elif isinstance(e, ClientThrottledError):
+            logger.warning("HTTP 429 from Instagram, back off and review proxy/account pressure")
+        elif isinstance(e, PleaseWaitFewMinutes):
+            logger.warning("Please wait before retrying: %s", e)
+        raise e
 
     def check_following(self):
-        if str(self.target_id) == self.api.authenticated_user_id:
+        if self.target_id == self.api.user_id:
             return True
-        endpoint = 'users/{user_id!s}/full_detail_info/'.format(**{'user_id': self.target_id})
-        return self.api._call_api(endpoint)['user_detail']['user']['friendship_status']['following']
+        try:
+            friendship = self.api.user_friendship_status(self.target_id)
+            return friendship.following
+        except Exception:
+            return False
 
     def check_private_profile(self):
         if self.is_private and not self.following:
             pc.printout("Impossible to execute command: user has private profile\n", pc.RED)
             send = input("Do you want send a follow request? [Y/N]: ")
             if send.lower() == "y":
-                self.api.friendships_create(self.target_id)
+                self.api.user_follow(self.target_id)
                 print("Sent a follow request to target. Use this command after target accepting the request.")
 
             return True
@@ -1182,39 +1197,21 @@ class Osintgram:
             return
 
         followers = []
-        
-        try:
 
+        try:
             pc.printout("Searching for emails of target followers... this can take a few minutes\n")
 
-            rank_token = AppClient.generate_uuid()
-            data = self.api.user_followers(str(self.target_id), rank_token=rank_token)
+            followers_dict = self.api.user_followers(self.target_id)
 
-            for user in data.get('users', []):
+            for uid, user_short in followers_dict.items():
                 u = {
-                    'id': user['pk'],
-                    'username': user['username'],
-                    'full_name': user['full_name']
+                    'id': user_short.pk,
+                    'username': user_short.username,
+                    'full_name': user_short.full_name or ''
                 }
                 followers.append(u)
 
-            next_max_id = data.get('next_max_id')
-            while next_max_id:
-                sys.stdout.write("\rCatched %i followers email" % len(followers))
-                sys.stdout.flush()
-                results = self.api.user_followers(str(self.target_id), rank_token=rank_token, max_id=next_max_id)
-                
-                for user in results.get('users', []):
-                    u = {
-                        'id': user['pk'],
-                        'username': user['username'],
-                        'full_name': user['full_name']
-                    }
-                    followers.append(u)
-
-                next_max_id = results.get('next_max_id')
-            
-            print("\n")
+            pc.printout("\nFound " + str(len(followers)) + " followers\n", pc.GREEN)
 
             results = []
             
@@ -1244,8 +1241,8 @@ class Osintgram:
 
             for follow in followers:
                 user = self.api.user_info(str(follow['id']))
-                if 'public_email' in user['user'] and user['user']['public_email']:
-                    follow['email'] = user['user']['public_email']
+                if user.public_email:
+                    follow['email'] = user.public_email
                     if len(results) > value:
                         break
                     results.append(follow)
@@ -1293,32 +1290,16 @@ class Osintgram:
 
             pc.printout("Searching for emails of users followed by target... this can take a few minutes\n")
 
-            rank_token = AppClient.generate_uuid()
-            data = self.api.user_following(str(self.target_id), rank_token=rank_token)
+            following_dict = self.api.user_following(self.target_id)
 
-            for user in data.get('users', []):
+            for uid, user_short in following_dict.items():
                 u = {
-                    'id': user['pk'],
-                    'username': user['username'],
-                    'full_name': user['full_name']
+                    'id': user_short.pk,
+                    'username': user_short.username,
+                    'full_name': user_short.full_name or ''
                 }
                 followings.append(u)
 
-            next_max_id = data.get('next_max_id')
-            
-            while next_max_id:
-                results = self.api.user_following(str(self.target_id), rank_token=rank_token, max_id=next_max_id)
-
-                for user in results.get('users', []):
-                    u = {
-                        'id': user['pk'],
-                        'username': user['username'],
-                        'full_name': user['full_name']
-                    }
-                    followings.append(u)
-
-                next_max_id = results.get('next_max_id')
-        
             results = []
             
             pc.printout("Do you want to get all emails? y/n: ", pc.YELLOW)
@@ -1349,8 +1330,8 @@ class Osintgram:
                 sys.stdout.write("\rCatched %i followings email" % len(results))
                 sys.stdout.flush()
                 user = self.api.user_info(str(follow['id']))
-                if 'public_email' in user['user'] and user['user']['public_email']:
-                    follow['email'] = user['user']['public_email']
+                if user.public_email:
+                    follow['email'] = user.public_email
                     if len(results) > value:
                         break
                     results.append(follow)
@@ -1392,39 +1373,22 @@ class Osintgram:
     def get_fwingsnumber(self):
         if self.check_private_profile():
             return
-       
-        try:
 
+        try:
             pc.printout("Searching for phone numbers of users followed by target... this can take a few minutes\n")
 
             followings = []
 
-            rank_token = AppClient.generate_uuid()
-            data = self.api.user_following(str(self.target_id), rank_token=rank_token)
+            following_dict = self.api.user_following(self.target_id)
 
-            for user in data.get('users', []):
+            for uid, user_short in following_dict.items():
                 u = {
-                    'id': user['pk'],
-                    'username': user['username'],
-                    'full_name': user['full_name']
+                    'id': user_short.pk,
+                    'username': user_short.username,
+                    'full_name': user_short.full_name or ''
                 }
                 followings.append(u)
 
-            next_max_id = data.get('next_max_id')
-            
-            while next_max_id:
-                results = self.api.user_following(str(self.target_id), rank_token=rank_token, max_id=next_max_id)
-
-                for user in results.get('users', []):
-                    u = {
-                        'id': user['pk'],
-                        'username': user['username'],
-                        'full_name': user['full_name']
-                    }
-                    followings.append(u)
-
-                next_max_id = results.get('next_max_id')
-       
             results = []
         
             pc.printout("Do you want to get all phone numbers? y/n: ", pc.YELLOW)
@@ -1455,8 +1419,8 @@ class Osintgram:
                 sys.stdout.write("\rCatched %i followings phone numbers" % len(results))
                 sys.stdout.flush()
                 user = self.api.user_info(str(follow['id']))
-                if 'contact_phone_number' in user['user'] and user['user']['contact_phone_number']:
-                    follow['contact_phone_number'] = user['user']['contact_phone_number']
+                if user.contact_phone_number:
+                    follow['contact_phone_number'] = user.contact_phone_number
                     if len(results) > value:
                         break
                     results.append(follow)
@@ -1505,33 +1469,16 @@ class Osintgram:
 
             pc.printout("Searching for phone numbers of users followers... this can take a few minutes\n")
 
+            followers_dict = self.api.user_followers(self.target_id)
 
-            rank_token = AppClient.generate_uuid()
-            data = self.api.user_following(str(self.target_id), rank_token=rank_token)
-
-            for user in data.get('users', []):
+            for uid, user_short in followers_dict.items():
                 u = {
-                    'id': user['pk'],
-                    'username': user['username'],
-                    'full_name': user['full_name']
+                    'id': user_short.pk,
+                    'username': user_short.username,
+                    'full_name': user_short.full_name or ''
                 }
                 followings.append(u)
 
-            next_max_id = data.get('next_max_id')
-            
-            while next_max_id:
-                results = self.api.user_following(str(self.target_id), rank_token=rank_token, max_id=next_max_id)
-
-                for user in results.get('users', []):
-                    u = {
-                        'id': user['pk'],
-                        'username': user['username'],
-                        'full_name': user['full_name']
-                    }
-                    followings.append(u)
-
-                next_max_id = results.get('next_max_id')
-        
             results = []
             
             pc.printout("Do you want to get all phone numbers? y/n: ", pc.YELLOW)
@@ -1562,8 +1509,8 @@ class Osintgram:
                 sys.stdout.write("\rCatched %i followers phone numbers" % len(results))
                 sys.stdout.flush()
                 user = self.api.user_info(str(follow['id']))
-                if 'contact_phone_number' in user['user'] and user['user']['contact_phone_number']:
-                    follow['contact_phone_number'] = user['user']['contact_phone_number']
+                if user.contact_phone_number:
+                    follow['contact_phone_number'] = user.contact_phone_number
                     if len(results) > value:
                         break
                     results.append(follow)
