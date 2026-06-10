@@ -1221,12 +1221,12 @@ class Osintgram:
             pc.printout("Do you want to get all emails? y/n: ", pc.YELLOW)
             value = input()
             
-            if value == str("y") or value == str("yes") or value == str("Yes") or value == str("YES"):
+            if value.lower() in ('y', 'yes'):
                 value = len(followers)
-            elif value == str(""):
+            elif value == '':
                 print("\n")
                 return
-            elif value == str("n") or value == str("no") or value == str("No") or value == str("NO"):
+            elif value.lower() in ('n', 'no'):
                 while True:
                     try:
                         pc.printout("How many emails do you want to get? ", pc.YELLOW)
@@ -1324,12 +1324,12 @@ class Osintgram:
             pc.printout("Do you want to get all emails? y/n: ", pc.YELLOW)
             value = input()
             
-            if value == str("y") or value == str("yes") or value == str("Yes") or value == str("YES"):
+            if value.lower() in ('y', 'yes'):
                 value = len(followings)
-            elif value == str(""):
+            elif value == '':
                 print("\n")
                 return
-            elif value == str("n") or value == str("no") or value == str("No") or value == str("NO"):
+            elif value.lower() in ('n', 'no'):
                 while True:
                     try:
                         pc.printout("How many emails do you want to get? ", pc.YELLOW)
@@ -1430,12 +1430,12 @@ class Osintgram:
             pc.printout("Do you want to get all phone numbers? y/n: ", pc.YELLOW)
             value = input()
             
-            if value == str("y") or value == str("yes") or value == str("Yes") or value == str("YES"):
+            if value.lower() in ('y', 'yes'):
                 value = len(followings)
-            elif value == str(""):
+            elif value == '':
                 print("\n")
                 return
-            elif value == str("n") or value == str("no") or value == str("No") or value == str("NO"):
+            elif value.lower() in ('n', 'no'):
                 while True:
                     try:
                         pc.printout("How many phone numbers do you want to get? ", pc.YELLOW)
@@ -1537,12 +1537,12 @@ class Osintgram:
             pc.printout("Do you want to get all phone numbers? y/n: ", pc.YELLOW)
             value = input()
             
-            if value == str("y") or value == str("yes") or value == str("Yes") or value == str("YES"):
+            if value.lower() in ('y', 'yes'):
                 value = len(followings)
-            elif value == str(""):
+            elif value == '':
                 print("\n")
                 return
-            elif value == str("n") or value == str("no") or value == str("No") or value == str("NO"):
+            elif value.lower() in ('n', 'no'):
                 while True:
                     try:
                         pc.printout("How many phone numbers do you want to get? ", pc.YELLOW)
